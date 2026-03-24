@@ -65,7 +65,7 @@ def extract_pdf_fast(
         show_progress=show_progress,
         table_strategy="text",  # Better for mixed table types
         write_images=image_dir is not None,
-        image_path=image_dir,
+        image_path=str(image_dir) if image_dir else None,
     )
 
     # Replace pymupdf4llm's default page separator with explicit sentinel.
@@ -214,7 +214,7 @@ def extract_pdf_to_markdown(
         )
         return md
     else:
-        return extract_pdf_fast(pdf_path, show_progress)
+        return extract_pdf_fast(pdf_path, show_progress=show_progress)
 
 
 def get_page_count(pdf_path: str) -> int:
