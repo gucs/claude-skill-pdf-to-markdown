@@ -5,7 +5,10 @@ PDF extraction with multiple backends:
 """
 
 import os
+import shutil
 import sys
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 # Suppress PyMuPDF's "Consider using pymupdf_layout" recommendation
@@ -21,6 +24,44 @@ os.environ.setdefault("PYMUPDF_SUGGEST_LAYOUT_ANALYZER", "0")
 # 3.3.0: Image paths in cached markdown now use relative 'images/' prefix
 #        (fixes broken temp directory references in cached output)
 EXTRACTOR_VERSION = "3.3.0"
+
+
+def _is_ascii_path(path: str) -> bool:
+    """Check if path contains only ASCII characters."""
+    try:
+        str(path).encode("ascii")
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
+@contextmanager
+def _safe_pdf_path(pdf_path: str):
+    """Context manager that yields an ASCII-safe path for third-party libraries.
+
+    Some libraries (pymupdf4llm, docling) may have issues with CJK characters
+    in file paths. When the path contains non-ASCII characters, this copies
+    the file to a temporary location with an ASCII-safe name.
+    """
+    if _is_ascii_path(pdf_path):
+        yield pdf_path
+        return
+
+    suffix = Path(pdf_path).suffix  # preserve .pdf extension
+    tmp_file = tempfile.NamedTemporaryFile(
+        suffix=suffix, prefix="pdf_safe_", delete=False
+    )
+    tmp_path = tmp_file.name
+    tmp_file.close()
+
+    try:
+        shutil.copy2(pdf_path, tmp_path)
+        yield tmp_path
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 def check_docling_models():
@@ -60,13 +101,14 @@ def extract_pdf_fast(
 
     # Use text strategy which handles borderless tables better
     # than the default lines_strict
-    markdown = pymupdf4llm.to_markdown(
-        pdf_path,
-        show_progress=show_progress,
-        table_strategy="text",  # Better for mixed table types
-        write_images=image_dir is not None,
-        image_path=str(image_dir) if image_dir else None,
-    )
+    with _safe_pdf_path(pdf_path) as safe_path:
+        markdown = pymupdf4llm.to_markdown(
+            safe_path,
+            show_progress=show_progress,
+            table_strategy="text",  # Better for mixed table types
+            write_images=image_dir is not None,
+            image_path=str(image_dir) if image_dir else None,
+        )
 
     # Replace pymupdf4llm's default page separator with explicit sentinel.
     # This prevents false splits when documents contain literal "-----"
@@ -155,8 +197,9 @@ def extract_pdf_docling(
         }
     )
 
-    # Convert the document
-    result = converter.convert(pdf_path)
+    # Convert the document (use ASCII-safe path for CJK compatibility)
+    with _safe_pdf_path(pdf_path) as safe_path:
+        result = converter.convert(safe_path)
 
     # Check for conversion errors
     if hasattr(result, "errors") and result.errors:
@@ -221,10 +264,11 @@ def get_page_count(pdf_path: str) -> int:
     """Get the number of pages in a PDF using pymupdf (faster than Docling for this)."""
     import pymupdf
 
-    doc = pymupdf.open(pdf_path)
-    count = len(doc)
-    doc.close()
-    return count
+    with _safe_pdf_path(pdf_path) as safe_path:
+        doc = pymupdf.open(safe_path)
+        count = len(doc)
+        doc.close()
+        return count
 
 
 def extract_images(pdf_path: str, output_dir: str, show_progress: bool = False) -> list:
@@ -243,48 +287,49 @@ def extract_images(pdf_path: str, output_dir: str, show_progress: bool = False) 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    doc = pymupdf.open(pdf_path)
-    extracted = []
-    image_count = 0
-    seen_xrefs = set()  # Track already-extracted images by xref
+    with _safe_pdf_path(pdf_path) as safe_path:
+        doc = pymupdf.open(safe_path)
+        extracted = []
+        image_count = 0
+        seen_xrefs = set()  # Track already-extracted images by xref
 
-    for page_num in range(len(doc)):
-        page = doc[page_num]
-        # full=True includes images nested inside form XObjects (common in
-        # documents exported from Word/PowerPoint)
-        images = page.get_images(full=True)
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            # full=True includes images nested inside form XObjects (common in
+            # documents exported from Word/PowerPoint)
+            images = page.get_images(full=True)
 
-        for img_index, img in enumerate(images):
-            try:
-                xref = img[0]
+            for img_index, img in enumerate(images):
+                try:
+                    xref = img[0]
 
-                # Skip if we've already extracted this image
-                if xref in seen_xrefs:
+                    # Skip if we've already extracted this image
+                    if xref in seen_xrefs:
+                        continue
+                    seen_xrefs.add(xref)
+
+                    pix = pymupdf.Pixmap(doc, xref)
+
+                    # Convert CMYK to RGB if necessary
+                    if pix.n - pix.alpha > 3:
+                        pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
+
+                    image_count += 1
+                    img_filename = f"image_{image_count:04d}.png"
+                    img_path = output_path / img_filename
+                    pix.save(str(img_path))
+                    extracted.append(str(img_path))
+
+                    pix = None
+                except Exception as e:
+                    # Log instead of silently swallowing errors
+                    print(
+                        f"WARNING: Failed to extract image {img_index} on page {page_num + 1}: {e}",
+                        file=sys.stderr,
+                    )
                     continue
-                seen_xrefs.add(xref)
 
-                pix = pymupdf.Pixmap(doc, xref)
-
-                # Convert CMYK to RGB if necessary
-                if pix.n - pix.alpha > 3:
-                    pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
-
-                image_count += 1
-                img_filename = f"image_{image_count:04d}.png"
-                img_path = output_path / img_filename
-                pix.save(str(img_path))
-                extracted.append(str(img_path))
-
-                pix = None
-            except Exception as e:
-                # Log instead of silently swallowing errors
-                print(
-                    f"WARNING: Failed to extract image {img_index} on page {page_num + 1}: {e}",
-                    file=sys.stderr,
-                )
-                continue
-
-    doc.close()
+        doc.close()
 
     if show_progress and extracted:
         print(f"Extracted {len(extracted)} unique images", file=sys.stderr)
