@@ -332,7 +332,7 @@ class ImageManager:
     def create_temp_dir(self, pdf_path: str) -> Path:
         """Create tracked temp directory for image extraction."""
         pdf_name = Path(pdf_path).stem
-        safe_name = re.sub(r"[^\w\-_]", "_", pdf_name)
+        safe_name = re.sub(r"[^a-zA-Z0-9\-_]", "_", pdf_name)
         temp_dir = Path(tempfile.mkdtemp(prefix=f"pdf_images_{safe_name}_"))
         self._temp_dirs.append(temp_dir)
         return temp_dir
